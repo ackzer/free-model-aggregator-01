@@ -79,6 +79,8 @@ import {
   openAIToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
+import { createProviderRouter } from './lib/router.ts';
+import { retryWithBackoff } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -140,6 +142,7 @@ interface Route {
  * with a free model meeting the requirements, and that provider's first model by id.
  */
 interface Candidate extends Route { rating: number }
+const providerRouter = createProviderRouter<Candidate>();
 let routePlan = new Map<string, Candidate>();
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
@@ -171,7 +174,8 @@ function routeFor(requires: Requirement, requestId?: string, excluded = new Set<
   currentRequestRequiresJson = requires.json === true;
   const planned = requestId ? routePlan.get(requestId) : undefined;
   if (planned && !excluded.has(planned.probe.provider.id)) return planned;
-  return candidatesFor(requires).find((candidate) => !excluded.has(candidate.probe.provider.id) && openAICompatibleFor(candidate.probe,candidate.model)) ?? null;
+  const candidates = candidatesFor(requires).filter((candidate) => !excluded.has(candidate.probe.provider.id) && openAICompatibleFor(candidate.probe, candidate.model));
+  return providerRouter.select('*', candidates.map((candidate) => ({ providerId: candidate.probe.provider.id, model: '*', value: candidate })))?.value ?? null;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -391,14 +395,22 @@ async function parseOpenAIStream(text: string): Promise<Json> {
 async function callWithFailover(requires: Requirement, body: Json, api: 'openai' | 'anthropic', requestId?: string): Promise<{ route: Route; response: Response } | null> {
   const excluded = new Set<string>();
   const first = routeFor(requires, requestId);
-  const ordered = [...(first ? [first] : []), ...candidatesFor(requires).filter((candidate) => candidate.probe.provider.id !== first?.probe.provider.id)];
+  const ranked = [...(first ? [first] : []), ...candidatesFor(requires).filter((candidate) => candidate.probe.provider.id !== first?.probe.provider.id)];
+  const ordered = providerRouter.ordered('*', ranked.map((candidate) => ({ providerId: candidate.probe.provider.id, model: '*', value: candidate }))).map((candidate) => candidate.value);
   for (const route of ordered) {
     if (excluded.has(route.probe.provider.id)) continue;
     excluded.add(route.probe.provider.id);
+    const startedAt = Date.now();
     try {
-      const response = await callProvider(route, body, api);
+      const response = await retryWithBackoff(async () => {
+        const upstream = await callProvider(route, body, api);
+        if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
+        return upstream;
+      }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
+      providerRouter.record(route.probe.provider.id, response.ok, Date.now() - startedAt);
       if (response.ok) return { route, response };
     } catch {
+      providerRouter.record(route.probe.provider.id, false, Date.now() - startedAt);
       // A failed provider is exhausted for this request; continue in rating order.
     }
   }
