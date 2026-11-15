@@ -83,6 +83,7 @@ import { createProviderRouter } from './lib/router.ts';
 import { retryWithBackoff } from './lib/retry.ts';
 import { createResponseCache } from './lib/cache.ts';
 import { buildCacheKey } from './lib/normalize.ts';
+import { classifyUpstreamError, recordUpstreamError } from './lib/errors.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -426,14 +427,17 @@ async function callWithFailover(requires: Requirement, body: Json, api: 'openai'
           return callProvider(route, body, api);
         }, { attempts: 2, shouldRetry: isNetworkError });
         providerRouter.record(route.probe.provider.id, response.ok, route.model.id);
+        if (!response.ok) recordUpstreamError(route.probe.provider.id, route.model.id, classifyUpstreamError(response.status));
         if (response.ok) return { route, response };
         continue;
       }
       const cached = await responseCache.getOrLoad(cacheKey, loadSnapshot, (snapshot) => snapshot.status >= 200 && snapshot.status < 300);
       const response = new Response(cached.body.slice(), { status: cached.status, statusText: cached.statusText, headers: cached.headers });
       providerRouter.record(route.probe.provider.id, response.ok, route.model.id);
+      if (!response.ok) recordUpstreamError(route.probe.provider.id, route.model.id, classifyUpstreamError(response.status));
       if (response.ok) return { route, response };
     } catch {
+      recordUpstreamError(route.probe.provider.id, route.model.id, classifyUpstreamError(null));
       providerRouter.record(route.probe.provider.id, false, route.model.id);
       // A failed provider is exhausted for this request; continue in rating order.
     }
