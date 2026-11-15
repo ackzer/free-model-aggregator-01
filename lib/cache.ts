@@ -6,9 +6,8 @@ export interface CacheStats {
 }
 
 export interface ResponseCacheOptions {
-  ttlMs?: number;
+  maxHits?: number;
   maxSize?: number;
-  now?: () => number;
 }
 
 export interface ResponseCache<T> {
@@ -20,10 +19,9 @@ export interface ResponseCache<T> {
 }
 
 export function createResponseCache<T>(options: ResponseCacheOptions = {}): ResponseCache<T> {
-  const ttlMs = Math.max(0, options.ttlMs ?? 30_000);
+  const maxHits = Math.max(0, Math.floor(options.maxHits ?? 32));
   const maxSize = Math.max(1, Math.floor(options.maxSize ?? 256));
-  const now = options.now ?? Date.now;
-  const entries = new Map<string, { value: T; expiresAt: number }>();
+  const entries = new Map<string, { value: T; remainingHits: number }>();
   const inFlight = new Map<string, Promise<T>>();
   let hits = 0;
   let misses = 0;
@@ -31,19 +29,20 @@ export function createResponseCache<T>(options: ResponseCacheOptions = {}): Resp
   const get = (key: string): T | undefined => {
     const entry = entries.get(key);
     if (!entry) return undefined;
-    if (entry.expiresAt <= now()) {
+    if (entry.remainingHits <= 0) {
       entries.delete(key);
       return undefined;
     }
     entries.delete(key);
+    entry.remainingHits -= 1;
     entries.set(key, entry);
     return entry.value;
   };
 
   const set = (key: string, value: T): void => {
-    if (ttlMs === 0) return;
+    if (maxHits === 0) return;
     entries.delete(key);
-    entries.set(key, { value, expiresAt: now() + ttlMs });
+    entries.set(key, { value, remainingHits: maxHits });
     while (entries.size > maxSize) entries.delete(entries.keys().next().value as string);
   };
 
@@ -56,9 +55,12 @@ export function createResponseCache<T>(options: ResponseCacheOptions = {}): Resp
         hits += 1;
         return cached;
       }
-      misses += 1;
       const pending = inFlight.get(key);
-      if (pending) return pending;
+      if (pending) {
+        hits += 1;
+        return pending;
+      }
+      misses += 1;
       const request = loader().then((value) => {
         if (shouldStore(value)) set(key, value);
         return value;

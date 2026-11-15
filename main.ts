@@ -143,8 +143,8 @@ interface Route {
  * with a free model meeting the requirements, and that provider's first model by id.
  */
 interface Candidate extends Route { rating: number }
-const providerRouter = createProviderRouter<Candidate>();
-const responseCache = createResponseCache<{ status: number; statusText: string; headers: [string, string][]; body: Uint8Array }>({ ttlMs: 15_000, maxSize: 128 });
+const providerRouter = createProviderRouter<Candidate>({ cooldownRequests: 2, providerOrder: brief.directory.providers.map((provider) => provider.id) });
+const responseCache = createResponseCache<{ status: number; statusText: string; headers: [string, string][]; body: Uint8Array }>({ maxHits: 32, maxSize: 128 });
 let routePlan = new Map<string, Candidate>();
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
@@ -175,7 +175,10 @@ function planRoutes(): void {
 function routeFor(requires: Requirement, requestId?: string, excluded = new Set<string>()): Route | null {
   currentRequestRequiresJson = requires.json === true;
   const planned = requestId ? routePlan.get(requestId) : undefined;
-  if (planned && !excluded.has(planned.probe.provider.id)) return planned;
+  if (planned && !excluded.has(planned.probe.provider.id)) {
+    const plannedHealth = providerRouter.healthForModel(planned.model.id, planned.probe.provider.id);
+    if (plannedHealth.cooldownRequests === 0 && providerRouter.health(planned.probe.provider.id).cooldownRequests === 0) return planned;
+  }
   const candidates = candidatesFor(requires).filter((candidate) => !excluded.has(candidate.probe.provider.id) && openAICompatibleFor(candidate.probe, candidate.model));
   return providerRouter.select('*', candidates.map((candidate) => ({ providerId: candidate.probe.provider.id, model: '*', value: candidate })))?.value ?? null;
 }
@@ -398,33 +401,37 @@ async function callWithFailover(requires: Requirement, body: Json, api: 'openai'
   const excluded = new Set<string>();
   const first = routeFor(requires, requestId);
   const ranked = [...(first ? [first] : []), ...candidatesFor(requires).filter((candidate) => candidate.probe.provider.id !== first?.probe.provider.id)];
-  const ordered = providerRouter.ordered('*', ranked.map((candidate) => ({ providerId: candidate.probe.provider.id, model: '*', value: candidate }))).map((candidate) => candidate.value);
+  const ordered = providerRouter.ordered('*', ranked.map((candidate) => ({ providerId: candidate.probe.provider.id, model: candidate.model.id, value: candidate }))).map((candidate) => candidate.value);
   for (const route of ordered) {
     if (excluded.has(route.probe.provider.id)) continue;
     excluded.add(route.probe.provider.id);
-    const startedAt = Date.now();
     try {
       const requestBody = JSON.stringify(body);
       const cacheKey = JSON.stringify([route.probe.provider.id, api, route.model.id, requestBody]);
-      const cached = body.stream === true ? null : await responseCache.getOrLoad(cacheKey, async () => {
+      const loadSnapshot = async () => {
         const response = await retryWithBackoff(async () => {
           const upstream = await callProvider(route, body, api);
           if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
           return upstream;
-        }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
+        }, { attempts: 2 });
         return { status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body: new Uint8Array(await response.arrayBuffer()) };
-      }, (snapshot) => snapshot.status >= 200 && snapshot.status < 300);
-      const response = cached
-        ? new Response(cached.body.slice(), { status: cached.status, statusText: cached.statusText, headers: cached.headers })
-        : await retryWithBackoff(async () => {
-            const upstream = await callProvider(route, body, api);
-            if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
-            return upstream;
-          }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
-      providerRouter.record(route.probe.provider.id, response.ok, Date.now() - startedAt);
+      };
+      if (body.stream === true) {
+        const response = await retryWithBackoff(async () => {
+          const upstream = await callProvider(route, body, api);
+          if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
+          return upstream;
+        }, { attempts: 2 });
+        providerRouter.record(route.probe.provider.id, response.ok, route.model.id);
+        if (response.ok) return { route, response };
+        continue;
+      }
+      const cached = await responseCache.getOrLoad(cacheKey, loadSnapshot, (snapshot) => snapshot.status >= 200 && snapshot.status < 300);
+      const response = new Response(cached.body.slice(), { status: cached.status, statusText: cached.statusText, headers: cached.headers });
+      providerRouter.record(route.probe.provider.id, response.ok, route.model.id);
       if (response.ok) return { route, response };
     } catch {
-      providerRouter.record(route.probe.provider.id, false, Date.now() - startedAt);
+      providerRouter.record(route.probe.provider.id, false, route.model.id);
       // A failed provider is exhausted for this request; continue in rating order.
     }
   }
@@ -436,6 +443,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
+  providerRouter.advanceRequest();
   const requestId = currentRequestId;
   const result = await callWithFailover(requires, body, 'openai', requestId);
   if (!result) return sendError(res, 'openai', 503, 'no_free_model', 'all free providers refused this request');
@@ -455,6 +463,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
+  providerRouter.advanceRequest();
   const requestId = currentRequestId;
   const result = await callWithFailover(requires, body, 'anthropic', requestId);
   if (!result) return sendError(res, 'anthropic', 503, 'overloaded_error', 'all free providers refused this request');

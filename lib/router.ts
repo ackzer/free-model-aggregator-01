@@ -7,73 +7,95 @@ export interface ProviderCandidate<T> {
 export interface ProviderHealth {
   successes: number;
   failures: number;
-  latencyEwmaMs: number | null;
-  cooldownUntil: number;
+  cooldownRequests: number;
 }
 
 export interface ProviderRouter<T> {
-  select(model: string, candidates: readonly ProviderCandidate<T>[], now?: number): ProviderCandidate<T> | null;
-  ordered(model: string, candidates: readonly ProviderCandidate<T>[], now?: number): ProviderCandidate<T>[];
-  record(providerId: string, succeeded: boolean, latencyMs: number, now?: number): void;
+  advanceRequest(): void;
+  select(model: string, candidates: readonly ProviderCandidate<T>[]): ProviderCandidate<T> | null;
+  ordered(model: string, candidates: readonly ProviderCandidate<T>[]): ProviderCandidate<T>[];
+  record(providerId: string, succeeded: boolean, model?: string): void;
   health(providerId: string): ProviderHealth;
+  healthForModel(model: string, providerId: string): ProviderHealth;
 }
 
 export interface RouterOptions {
-  ewmaAlpha?: number;
-  baseCooldownMs?: number;
-  maxCooldownMs?: number;
+  cooldownRequests?: number;
+  providerOrder?: readonly string[];
 }
 
 export function createProviderRouter<T>(options: RouterOptions = {}): ProviderRouter<T> {
-  const alpha = options.ewmaAlpha ?? 0.25;
-  const baseCooldownMs = options.baseCooldownMs ?? 500;
-  const maxCooldownMs = options.maxCooldownMs ?? 30_000;
+  const cooldownLength = Math.max(1, Math.floor(options.cooldownRequests ?? 2));
+  const order = new Map((options.providerOrder ?? []).map((providerId, index) => [providerId, index]));
   const states = new Map<string, ProviderHealth>();
+  const modelStates = new Map<string, ProviderHealth>();
+  const modelKey = (model: string, providerId: string) => `${model}\u0000${providerId}`;
   const stateFor = (providerId: string): ProviderHealth => {
     let state = states.get(providerId);
     if (!state) {
-      state = { successes: 0, failures: 0, latencyEwmaMs: null, cooldownUntil: 0 };
+      state = { successes: 0, failures: 0, cooldownRequests: 0 };
       states.set(providerId, state);
     }
     return state;
   };
 
-  const ordered = (model: string, candidates: readonly ProviderCandidate<T>[], now = Date.now()) =>
-    candidates.filter((candidate) => candidate.model === model)
-      .sort((a, b) => {
-        const ah = stateFor(a.providerId);
-        const bh = stateFor(b.providerId);
-        const aReady = ah.cooldownUntil <= now;
-        const bReady = bh.cooldownUntil <= now;
-        if (aReady !== bReady) return aReady ? -1 : 1;
-        const aLatency = ah.latencyEwmaMs ?? 0;
-        const bLatency = bh.latencyEwmaMs ?? 0;
-        if (aLatency !== bLatency) return aLatency - bLatency;
-        const aRate = ah.successes / Math.max(1, ah.successes + ah.failures);
-        const bRate = bh.successes / Math.max(1, bh.successes + bh.failures);
-        return bRate - aRate || a.providerId.localeCompare(b.providerId);
-      });
+  const stateForModel = (model: string, providerId: string): ProviderHealth => {
+    const key = modelKey(model, providerId);
+    let state = modelStates.get(key);
+    if (!state) {
+      state = { successes: 0, failures: 0, cooldownRequests: 0 };
+      modelStates.set(key, state);
+    }
+    return state;
+  };
+
+  const ordered = (model: string, candidates: readonly ProviderCandidate<T>[]) => candidates
+    .filter((candidate) => model === '*' || candidate.model === model)
+    .sort((a, b) => {
+      const am = stateForModel(model === '*' ? a.model : model, a.providerId);
+      const bm = stateForModel(model === '*' ? b.model : model, b.providerId);
+      const aScore = am.successes - am.failures;
+      const bScore = bm.successes - bm.failures;
+      if (aScore !== bScore) return bScore - aScore;
+      const ag = stateFor(a.providerId);
+      const bg = stateFor(b.providerId);
+      const agScore = ag.successes - ag.failures;
+      const bgScore = bg.successes - bg.failures;
+      if (agScore !== bgScore) return bgScore - agScore;
+      const aCooling = stateFor(a.providerId).cooldownRequests > 0;
+      const bCooling = stateFor(b.providerId).cooldownRequests > 0;
+      if (aCooling !== bCooling) return aCooling ? 1 : -1;
+      return (order.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.providerId) ?? Number.MAX_SAFE_INTEGER);
+    });
 
   return {
-    ordered,
-    select(model, candidates, now = Date.now()) {
-      return ordered(model, candidates, now).find((candidate) => stateFor(candidate.providerId).cooldownUntil <= now) ?? null;
+    advanceRequest() {
+      for (const state of states.values()) if (state.cooldownRequests > 0) state.cooldownRequests -= 1;
+      for (const state of modelStates.values()) if (state.cooldownRequests > 0) state.cooldownRequests -= 1;
     },
-    record(providerId, succeeded, latencyMs, now = Date.now()) {
+    ordered,
+    select(model, candidates) {
+      return ordered(model, candidates).find((candidate) => stateFor(candidate.providerId).cooldownRequests === 0 && stateForModel(model, candidate.providerId).cooldownRequests === 0) ?? null;
+    },
+    record(providerId, succeeded, model = '*') {
       const state = stateFor(providerId);
-      const sample = Math.max(0, latencyMs);
-      state.latencyEwmaMs = state.latencyEwmaMs === null ? sample : alpha * sample + (1 - alpha) * state.latencyEwmaMs;
       if (succeeded) {
         state.successes += 1;
         state.failures = 0;
-        state.cooldownUntil = 0;
+        state.cooldownRequests = 0;
       } else {
         state.failures += 1;
-        state.cooldownUntil = now + Math.min(maxCooldownMs, baseCooldownMs * 2 ** Math.min(state.failures - 1, 10));
+        state.cooldownRequests = cooldownLength + 1;
       }
+      const modelState = stateForModel(model, providerId);
+      if (succeeded) { modelState.successes += 1; modelState.failures = 0; modelState.cooldownRequests = 0; }
+      else { modelState.failures += 1; modelState.cooldownRequests = cooldownLength + 1; }
     },
     health(providerId) {
       return { ...stateFor(providerId) };
+    },
+    healthForModel(model, providerId) {
+      return { ...stateForModel(model, providerId) };
     },
   };
 }
