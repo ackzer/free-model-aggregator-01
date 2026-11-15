@@ -82,6 +82,7 @@ import {
 import { createProviderRouter } from './lib/router.ts';
 import { retryWithBackoff } from './lib/retry.ts';
 import { createResponseCache } from './lib/cache.ts';
+import { buildCacheKey } from './lib/normalize.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -180,7 +181,7 @@ function routeFor(requires: Requirement, requestId?: string, excluded = new Set<
     if (plannedHealth.cooldownRequests === 0 && providerRouter.health(planned.probe.provider.id).cooldownRequests === 0) return planned;
   }
   const candidates = candidatesFor(requires).filter((candidate) => !excluded.has(candidate.probe.provider.id) && openAICompatibleFor(candidate.probe, candidate.model));
-  return providerRouter.select('*', candidates.map((candidate) => ({ providerId: candidate.probe.provider.id, model: '*', value: candidate })))?.value ?? null;
+  return providerRouter.select('*', candidates.map((candidate) => ({ providerId: candidate.probe.provider.id, model: candidate.model.id, value: candidate })))?.value ?? null;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -318,6 +319,13 @@ async function callProvider(route: Route, body: Json, api: 'openai' | 'anthropic
   return fetch(url, { method: 'POST', headers, body: JSON.stringify(request) });
 }
 
+function isNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause = 'cause' in error ? error.cause : undefined;
+  return (error.name === 'TypeError' && /fetch failed|network error/i.test(error.message))
+    || (cause instanceof Error && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'].some((code) => cause.message.includes(code)));
+}
+
 /** Copy a provider's event stream to the client as it arrives. */
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = stream.getReader();
@@ -401,27 +409,22 @@ async function callWithFailover(requires: Requirement, body: Json, api: 'openai'
   const excluded = new Set<string>();
   const first = routeFor(requires, requestId);
   const ranked = [...(first ? [first] : []), ...candidatesFor(requires).filter((candidate) => candidate.probe.provider.id !== first?.probe.provider.id)];
-  const ordered = providerRouter.ordered('*', ranked.map((candidate) => ({ providerId: candidate.probe.provider.id, model: candidate.model.id, value: candidate }))).map((candidate) => candidate.value);
+  const ordered = providerRouter.ordered('*', ranked.map((candidate) => ({ providerId: candidate.probe.provider.id, model: candidate.model.id, value: candidate }))).filter((candidate) => providerRouter.health(candidate.providerId).cooldownRequests === 0 && providerRouter.healthForModel(candidate.model, candidate.providerId).cooldownRequests === 0).map((candidate) => candidate.value);
   for (const route of ordered) {
     if (excluded.has(route.probe.provider.id)) continue;
     excluded.add(route.probe.provider.id);
     try {
-      const requestBody = JSON.stringify(body);
-      const cacheKey = JSON.stringify([route.probe.provider.id, api, route.model.id, requestBody]);
+      const cacheKey = buildCacheKey(route.probe.provider.id, api, route.model.id, body);
       const loadSnapshot = async () => {
         const response = await retryWithBackoff(async () => {
-          const upstream = await callProvider(route, body, api);
-          if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
-          return upstream;
-        }, { attempts: 2 });
+          return callProvider(route, body, api);
+        }, { attempts: 2, shouldRetry: isNetworkError });
         return { status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body: new Uint8Array(await response.arrayBuffer()) };
       };
       if (body.stream === true) {
         const response = await retryWithBackoff(async () => {
-          const upstream = await callProvider(route, body, api);
-          if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
-          return upstream;
-        }, { attempts: 2 });
+          return callProvider(route, body, api);
+        }, { attempts: 2, shouldRetry: isNetworkError });
         providerRouter.record(route.probe.provider.id, response.ok, route.model.id);
         if (response.ok) return { route, response };
         continue;
@@ -443,9 +446,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
-  providerRouter.advanceRequest();
   const requestId = currentRequestId;
   const result = await callWithFailover(requires, body, 'openai', requestId);
+  providerRouter.advanceRequest();
   if (!result) return sendError(res, 'openai', 503, 'no_free_model', 'all free providers refused this request');
   const { route, response } = result;
   const upstream = response.headers.get('content-type')?.includes('text/event-stream')
@@ -463,9 +466,9 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
-  providerRouter.advanceRequest();
   const requestId = currentRequestId;
   const result = await callWithFailover(requires, body, 'anthropic', requestId);
+  providerRouter.advanceRequest();
   if (!result) return sendError(res, 'anthropic', 503, 'overloaded_error', 'all free providers refused this request');
   const { route, response } = result;
   const answer = normalizedAnswer(route.probe.provider.wire, response.headers.get('content-type')?.includes('text/event-stream') ? await parseOpenAIStream(await response.text()) : await response.json() as Json);

@@ -25,7 +25,7 @@ export interface RouterOptions {
 }
 
 export function createProviderRouter<T>(options: RouterOptions = {}): ProviderRouter<T> {
-  const cooldownLength = Math.max(1, Math.floor(options.cooldownRequests ?? 2));
+  const cooldownLength = Math.max(1, Math.floor(options.cooldownRequests ?? 1));
   const order = new Map((options.providerOrder ?? []).map((providerId, index) => [providerId, index]));
   const states = new Map<string, ProviderHealth>();
   const modelStates = new Map<string, ProviderHealth>();
@@ -51,22 +51,7 @@ export function createProviderRouter<T>(options: RouterOptions = {}): ProviderRo
 
   const ordered = (model: string, candidates: readonly ProviderCandidate<T>[]) => candidates
     .filter((candidate) => model === '*' || candidate.model === model)
-    .sort((a, b) => {
-      const am = stateForModel(model === '*' ? a.model : model, a.providerId);
-      const bm = stateForModel(model === '*' ? b.model : model, b.providerId);
-      const aScore = am.successes - am.failures;
-      const bScore = bm.successes - bm.failures;
-      if (aScore !== bScore) return bScore - aScore;
-      const ag = stateFor(a.providerId);
-      const bg = stateFor(b.providerId);
-      const agScore = ag.successes - ag.failures;
-      const bgScore = bg.successes - bg.failures;
-      if (agScore !== bgScore) return bgScore - agScore;
-      const aCooling = stateFor(a.providerId).cooldownRequests > 0;
-      const bCooling = stateFor(b.providerId).cooldownRequests > 0;
-      if (aCooling !== bCooling) return aCooling ? 1 : -1;
-      return (order.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.providerId) ?? Number.MAX_SAFE_INTEGER);
-    });
+    .sort((a, b) => (order.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.providerId) ?? Number.MAX_SAFE_INTEGER));
 
   return {
     advanceRequest() {
@@ -75,7 +60,7 @@ export function createProviderRouter<T>(options: RouterOptions = {}): ProviderRo
     },
     ordered,
     select(model, candidates) {
-      return ordered(model, candidates).find((candidate) => stateFor(candidate.providerId).cooldownRequests === 0 && stateForModel(model, candidate.providerId).cooldownRequests === 0) ?? null;
+      return ordered(model, candidates).find((candidate) => stateFor(candidate.providerId).cooldownRequests === 0 && stateForModel(candidate.model, candidate.providerId).cooldownRequests === 0) ?? null;
     },
     record(providerId, succeeded, model = '*') {
       const state = stateFor(providerId);
@@ -85,11 +70,11 @@ export function createProviderRouter<T>(options: RouterOptions = {}): ProviderRo
         state.cooldownRequests = 0;
       } else {
         state.failures += 1;
-        state.cooldownRequests = cooldownLength + 1;
+        state.cooldownRequests = cooldownLength;
       }
       const modelState = stateForModel(model, providerId);
       if (succeeded) { modelState.successes += 1; modelState.failures = 0; modelState.cooldownRequests = 0; }
-      else { modelState.failures += 1; modelState.cooldownRequests = cooldownLength + 1; }
+      else { modelState.failures += 1; modelState.cooldownRequests = cooldownLength; }
     },
     health(providerId) {
       return { ...stateFor(providerId) };

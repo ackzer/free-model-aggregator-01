@@ -4,7 +4,7 @@ export interface RetryOptions {
 }
 
 export async function retryWithBackoff<T>(operation: (attempt: number) => Promise<T>, options: RetryOptions = {}): Promise<T> {
-  const attempts = Math.max(1, Math.floor(options.attempts ?? 3));
+  const attempts = Math.min(2, Math.max(1, Math.floor(options.attempts ?? 2)));
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
