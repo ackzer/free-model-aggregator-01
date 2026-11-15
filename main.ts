@@ -430,8 +430,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
   const requestId = currentRequestId;
-  const converted = anthropicToOpenAI(body, routePlan.get(requestId ?? '')?.model.id ?? 'auto');
-  const result = await callWithFailover(requires, converted, 'anthropic', requestId);
+  const result = await callWithFailover(requires, body, 'anthropic', requestId);
   if (!result) return sendError(res, 'anthropic', 503, 'overloaded_error', 'all free providers refused this request');
   const { route, response } = result;
   const answer = normalizedAnswer(route.probe.provider.wire, response.headers.get('content-type')?.includes('text/event-stream') ? await parseOpenAIStream(await response.text()) : await response.json() as Json);
