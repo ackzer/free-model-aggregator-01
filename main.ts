@@ -81,6 +81,7 @@ import {
 } from './lib/wire.ts';
 import { createProviderRouter } from './lib/router.ts';
 import { retryWithBackoff } from './lib/retry.ts';
+import { createResponseCache } from './lib/cache.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -143,6 +144,7 @@ interface Route {
  */
 interface Candidate extends Route { rating: number }
 const providerRouter = createProviderRouter<Candidate>();
+const responseCache = createResponseCache<{ status: number; statusText: string; headers: [string, string][]; body: Uint8Array }>({ ttlMs: 15_000, maxSize: 128 });
 let routePlan = new Map<string, Candidate>();
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
@@ -402,11 +404,23 @@ async function callWithFailover(requires: Requirement, body: Json, api: 'openai'
     excluded.add(route.probe.provider.id);
     const startedAt = Date.now();
     try {
-      const response = await retryWithBackoff(async () => {
-        const upstream = await callProvider(route, body, api);
-        if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
-        return upstream;
-      }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
+      const requestBody = JSON.stringify(body);
+      const cacheKey = JSON.stringify([route.probe.provider.id, api, route.model.id, requestBody]);
+      const cached = body.stream === true ? null : await responseCache.getOrLoad(cacheKey, async () => {
+        const response = await retryWithBackoff(async () => {
+          const upstream = await callProvider(route, body, api);
+          if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
+          return upstream;
+        }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
+        return { status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body: new Uint8Array(await response.arrayBuffer()) };
+      }, (snapshot) => snapshot.status >= 200 && snapshot.status < 300);
+      const response = cached
+        ? new Response(cached.body.slice(), { status: cached.status, statusText: cached.statusText, headers: cached.headers })
+        : await retryWithBackoff(async () => {
+            const upstream = await callProvider(route, body, api);
+            if (!upstream.ok && (upstream.status === 429 || upstream.status >= 500)) throw Object.assign(new Error(`upstream HTTP ${upstream.status}`), { status: upstream.status });
+            return upstream;
+          }, { attempts: 2, baseDelayMs: 100, maxDelayMs: 300 });
       providerRouter.record(route.probe.provider.id, response.ok, Date.now() - startedAt);
       if (response.ok) return { route, response };
     } catch {
